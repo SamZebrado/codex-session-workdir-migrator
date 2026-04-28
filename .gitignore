@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# macOS
+.DS_Store
+
+# Codex specific
+backups/
+reports/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Sensitive local review files
+AUDIT_REPORT.md
+docs/inspection_report.md
+docs/migration_design.md
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local fixtures / archives
+*.zip
+
+# Temporary files
+*.tmp
+*.bak
