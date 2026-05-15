@@ -188,13 +188,16 @@ bundle.zip/
   --mode skip
 ```
 
-**冲突策略**：
+**Legacy 冲突策略（`--mode`）**：
 - `--mode skip`（默认）：如果目标机器已有该会话，则跳过
 - `--mode overwrite`：备份后覆盖已有会话
-- `--mode abort`（默认）：如果目标机器已有该会话，则报错退出
+
+**推荐冲突策略（`--on-conflict`）**：
+- `--on-conflict abort`（默认）：如果目标机器已有该会话，则报错退出
+- `--on-conflict overwrite`：备份后覆盖已有会话
+- `--on-conflict import-as-new`：即使目标机器已有该会话，导入为新会话
 
 **导入时新建 session ID**：
-- `--on-conflict import-as-new`：即使目标机器已有该会话，导入为新会话
 - `--new-session-id auto`：自动生成新 session ID
 - `--new-session-id <explicit-id>`：使用指定的 session ID
 
@@ -208,7 +211,7 @@ bundle.zip/
 - 敏感内容扫描（邮箱、云盘路径、中文路径）
 - SQLite schema 完整性检查（NOT NULL 约束风险）
 - 目标 session ID 冲突检测
-- SHA256SUMS.txt 校验和验证
+- SHA256SUMS.txt 供人工审计，自动校验功能尚未实现
 
 **真实写入需加 `--yes`**：
 ```bash
@@ -222,7 +225,7 @@ bundle.zip/
 - 路径包含中文字符
 - 路径包含 Google Drive 特殊路径
 
-可多次指定 `--map-cwd` 以处理多个路径映射。
+**注意**：当前版本仅支持一个 `--map-cwd` 映射。
 
 ---
 
