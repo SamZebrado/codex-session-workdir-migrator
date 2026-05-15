@@ -4,9 +4,16 @@
 ⚠️ 该工具仅适用于特定的 Codex 版本，架构可能随时变化。
 ⚠️ This tool only edits local Codex metadata on your own machine and is not affiliated with OpenAI.
 
-将 Codex 会话的工作目录引用从 `old_cwd` 迁移到 `new_cwd`，默认采用保守策略：**只改结构化状态，不改历史自然语言文本**。
+## 核心功能
+
+本工具提供两种迁移模式：
+
+1. **本地迁移（Local Migration）**：在同一台机器上将 Codex 会话的工作目录从旧路径迁移到新路径
+2. **跨电脑迁移（Portable Cross-machine Migration）**：将会话打包为 ZIP，在不同电脑之间迁移
 
 ## 默认行为（structured-only）
+
+默认采用保守策略：**只改结构化状态，不改历史自然语言文本**。
 
 默认只会修改：
 - JSONL `session_meta.payload.cwd`
@@ -49,15 +56,17 @@
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
 
-## 命令
+---
 
-### inspect
+# Part 1: 本地迁移命令
+
+## inspect
 
 ```bash
 ./codex_workdir_migrate.py inspect --session <session-id> --codex-home <fixture-codex-home>
 ```
 
-### plan
+## plan
 
 ```bash
 ./codex_workdir_migrate.py plan \
@@ -77,7 +86,7 @@ python3 -m unittest discover -s tests -p 'test_*.py' -q
   - `threads.cwd`
   - `threads.sandbox_policy`
 
-### apply（默认 dry-run）
+## apply（默认 dry-run）
 
 ```bash
 ./codex_workdir_migrate.py apply \
@@ -99,7 +108,7 @@ dry-run 会输出：
 - 哪些文件会改（`modified_files`）
 - 每类改动计数（`summary`）
 
-### verify
+## verify
 
 ```bash
 ./codex_workdir_migrate.py verify \
@@ -111,13 +120,118 @@ dry-run 会输出：
 
 `verify` 与 `plan/apply` 使用同一策略口径，避免漏检或误报。
 
-## 安全建议
+---
+
+# Part 2: 跨电脑迁移命令
+
+本部分功能用于在不同电脑之间迁移 Codex 会话。
+
+## export-bundle
+
+将会话打包为 portable ZIP：
+
+```bash
+./codex_workdir_migrate.py export-bundle \
+  --session <session-id> \
+  --codex-home ~/.codex \
+  --out /tmp/codex_session_<session-id>_migration_bundle.zip
+```
+
+Bundle 结构：
+```
+bundle.zip/
+  MANIFEST.json
+  README_IMPORT.md
+  inspection/
+    inspect_report.json
+  sessions/
+    raw_jsonl/
+      rollout-....jsonl
+  index/
+    session_index_records.jsonl
+  sqlite/
+    state_db_matching_rows.json
+  checksums/
+    SHA256SUMS.txt
+```
+
+**安全说明**：Bundle 不包含认证文件（auth.json, tokens, credentials 等）。
+
+## import-plan
+
+在目标机器上生成导入计划（只读）：
+
+```bash
+./codex_workdir_migrate.py import-plan \
+  --bundle /tmp/codex_session_<session-id>_migration_bundle.zip \
+  --codex-home ~/.codex \
+  --map-cwd "/old/path=/new/path"
+```
+
+`import-plan` 会输出：
+- Bundle 内容摘要
+- 目标机器是否已有该会话
+- 计划修改的文件
+- CWD 映射详情
+- 风险提示
+
+## import-bundle
+
+执行跨电脑导入：
+
+```bash
+./codex_workdir_migrate.py import-bundle \
+  --bundle /tmp/codex_session_<session-id>_migration_bundle.zip \
+  --codex-home ~/.codex \
+  --map-cwd "/old/path=/new/path" \
+  --backup-dir ./import_backups \
+  --mode skip
+```
+
+**冲突策略**：
+- `--mode skip`（默认）：如果目标机器已有该会话，则跳过
+- `--mode overwrite`：备份后覆盖已有会话
+- `--mode merge`：暂不支持
+
+**真实写入需加 `--yes`**：
+```bash
+./codex_workdir_migrate.py import-bundle ... --yes
+```
+
+## CWD 映射说明
+
+`--map-cwd` 支持：
+- 路径包含空格
+- 路径包含中文字符
+- 路径包含 Google Drive 特殊路径
+
+可多次指定 `--map-cwd` 以处理多个路径映射。
+
+---
+
+# Part 3: 安全建议
 
 - 执行真实迁移前先做 `plan` 和 dry-run `apply`
 - 如需扩大修改范围，显式添加开关，不建议默认开启
 - 对真实 `~/.codex` 操作前，先在 fixture 上完整验证流程
+- 跨电脑迁移前，先运行 `import-plan` 查看导入计划
+- 使用 `--mode overwrite` 时，工具会自动创建备份
 
-## 可复现 smoke flow（不碰真实 ~/.codex）
+## 敏感文件排除
+
+以下文件**不会**被打包进 bundle：
+- `auth.json`
+- `tokens`
+- `credentials`
+- `cookies`
+- `keychain`
+- `.netrc`
+- `.env`
+- 其他疑似认证凭据
+
+---
+
+# Part 4: 可复现 smoke flow（不碰真实 ~/.codex）
 
 下面的流程只会写入 `/private/tmp/.../codex_home` 这个 fake Codex home。
 
@@ -127,6 +241,8 @@ python3 tests/make_smoke_fixture.py "$SMOKE_ROOT"
 ```
 
 脚本会输出本轮要使用的 `CODEX_HOME`、`SESSION_ID`、`OLD_CWD`、`NEW_CWD`、`BACKUP_DIR`。随后用这些值运行：
+
+### 本地迁移 smoke flow
 
 ```bash
 python3 codex_workdir_migrate.py inspect \
@@ -173,4 +289,53 @@ python3 codex_workdir_migrate.py verify \
   --codex-home "$SMOKE_ROOT/codex_home"
 ```
 
+### 跨电脑迁移 smoke flow
+
+```bash
+# Step 1: 在 source 机器上导出 bundle
+python3 codex_workdir_migrate.py export-bundle \
+  --session smoke-session \
+  --codex-home "$SMOKE_ROOT/codex_home" \
+  --out /tmp/bundle.zip
+
+# Step 2: 在 target 机器上生成导入计划
+python3 codex_workdir_migrate.py import-plan \
+  --bundle /tmp/bundle.zip \
+  --codex-home "$SMOKE_ROOT/target_codex_home" \
+  --map-cwd "/tmp/codex-migrator-old=$SMOKE_ROOT/new_workdir"
+
+# Step 3: 执行导入（dry-run）
+python3 codex_workdir_migrate.py import-bundle \
+  --bundle /tmp/bundle.zip \
+  --codex-home "$SMOKE_ROOT/target_codex_home" \
+  --map-cwd "/tmp/codex-migrator-old=$SMOKE_ROOT/new_workdir" \
+  --backup-dir "$SMOKE_ROOT/import_backups" \
+  --mode skip
+
+# Step 4: 真实写入
+python3 codex_workdir_migrate.py import-bundle \
+  --bundle /tmp/bundle.zip \
+  --codex-home "$SMOKE_ROOT/target_codex_home" \
+  --map-cwd "/tmp/codex-migrator-old=$SMOKE_ROOT/new_workdir" \
+  --backup-dir "$SMOKE_ROOT/import_backups" \
+  --mode skip \
+  --yes
+```
+
 真实迁移时如果省略 `--codex-home`，工具会默认指向 `~/.codex`；在测试和 smoke 中始终传入临时 fixture 的 `--codex-home`。
+
+---
+
+# 已知限制
+
+详见 [docs/known_limits.md](docs/known_limits.md)
+
+---
+
+# 文档索引
+
+- [current_capability_audit.md](docs/current_capability_audit.md) - 当前能力审计
+- [bundle_format.md](docs/bundle_format.md) - Bundle 格式说明
+- [import_safety.md](docs/import_safety.md) - 导入安全指南
+- [known_limits.md](docs/known_limits.md) - 已知限制
+- [migration_design.md](docs/migration_design.md) - 迁移设计文档

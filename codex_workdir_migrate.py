@@ -2,6 +2,7 @@
 """
 Codex Session Working Directory Migration Tool
 Safely migrates a Codex session from one working directory to another.
+Supports local migration and cross-machine bundle export/import.
 """
 
 import argparse
@@ -9,13 +10,19 @@ import copy
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
+import socket
 import sqlite3
+import subprocess
 import sys
-from dataclasses import dataclass
+import uuid
+import zipfile
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 
@@ -28,12 +35,71 @@ JSONL_CATEGORIES = (
 )
 SQLITE_FIELDS = ("threads.cwd", "threads.sandbox_policy")
 
+TOOL_VERSION = "0.2.1"
+
+SENSITIVE_FILES = {
+    "auth.json",
+    "cookies",
+    "credentials",
+    "tokens",
+    "keychain",
+    ".netrc",
+    ".pypirc",
+    ".npmrc",
+    ".git-credentials",
+    "id_rsa",
+    "id_ed25519",
+    ".env",
+    ".env.local",
+}
+
+SENSITIVE_DIRS = {
+    "backups",
+    "reports",
+    "node_modules",
+    ".git",
+    "__pycache__",
+}
+
+SENSITIVE_PATTERNS = [
+    re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+    re.compile(r"sk-[a-zA-Z0-9]{20,}"),
+    re.compile(r"pk_[a-zA-Z0-9]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"-----BEGIN (RSA|EC|DSA|OPENSSH) PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN DSA PRIVATE KEY-----"),
+    re.compile(r"-----BEGIN EC PRIVATE KEY-----"),
+    re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    re.compile(r"gho_[a-zA-Z0-9]{36}"),
+    re.compile(r"glpat-[a-zA-Z0-9]{20}"),
+]
+
 
 @dataclass(frozen=True)
 class MigrationPolicy:
     include_function_workdir: bool = False
     include_environment_context: bool = False
     rewrite_prefix_paths: bool = False
+
+
+@dataclass
+class BundleManifest:
+    tool_version: str
+    export_time: str
+    source_hostname: str
+    source_os: str
+    codex_version: Optional[str] = None
+    session_id: str = ""
+    detected_cwd: Optional[str] = None
+    included_files: List[str] = field(default_factory=list)
+    sqlite_rows: List[Dict] = field(default_factory=list)
+    excluded_sensitive_files: List[str] = field(default_factory=list)
+    bundle_structure: Dict = field(default_factory=dict)
+    checksums: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class CodexSessionMigrator:
@@ -87,7 +153,7 @@ class CodexSessionMigrator:
         if value == old_cwd:
             return new_cwd, True
         if rewrite_prefix_paths and value.startswith(old_cwd + os.sep):
-            suffix = value[len(old_cwd) :]
+            suffix = value[len(old_cwd):]
             return new_cwd + suffix, True
         return value, False
 
@@ -416,6 +482,56 @@ class CodexSessionMigrator:
                 hash_sha256.update(chunk)
         return hash_sha256.hexdigest()
 
+    def _scan_sensitive_content(self, content, file_name):
+        """Scan content for sensitive patterns. Returns list of findings."""
+        findings = []
+        if not isinstance(content, str):
+            content = content.decode("utf-8", errors="ignore")
+        
+        for pattern in SENSITIVE_PATTERNS:
+            matches = pattern.findall(content)
+            for match in matches[:3]:
+                findings.append({
+                    "file": file_name,
+                    "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
+                    "match": match[:80] + "..." if len(match) > 80 else match,
+                })
+            if len(matches) > 3:
+                findings.append({
+                    "file": file_name,
+                    "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
+                    "match": f"{len(matches) - 3} more matches",
+                })
+        return findings
+
+    def _rewrite_session_id_in_json(self, data, old_id, new_id):
+        """Rewrite session ID in JSON data conservatively.
+        
+        Only replaces string values that exactly match the old session ID.
+        Does not modify text fields like messages, prompts, or descriptions.
+        """
+        text_field_names = {"message", "text", "content", "summary", "description", "title"}
+        
+        def rewrite(node):
+            if isinstance(node, str):
+                if node == old_id:
+                    return new_id
+                return node
+            if isinstance(node, list):
+                return [rewrite(item) for item in node]
+            if isinstance(node, dict):
+                result = {}
+                for key, value in node.items():
+                    key_lower = key.lower()
+                    if key_lower in text_field_names:
+                        result[key] = value
+                    else:
+                        result[key] = rewrite(value)
+                return result
+            return node
+        
+        return rewrite(data)
+
     def create_backup(self, backup_dir, files_to_backup):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = os.path.join(backup_dir, f"backup_{timestamp}")
@@ -664,6 +780,962 @@ class CodexSessionMigrator:
 
         return result
 
+    def _get_codex_version(self):
+        """Attempt to get Codex CLI version."""
+        try:
+            result = subprocess.run(
+                ["codex", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception:
+            pass
+        return None
+
+    def export_bundle(self, session_id, output_path, allow_sensitive_content=False):
+        """Export session bundle for cross-machine migration."""
+        result = {
+            "success": False,
+            "bundle_path": None,
+            "manifest": None,
+            "errors": [],
+            "sensitive_findings": [],
+        }
+
+        manifest = BundleManifest(
+            tool_version=TOOL_VERSION,
+            export_time=datetime.now().isoformat(),
+            source_hostname=socket.gethostname(),
+            source_os=f"{platform.system()} {platform.release()}",
+            codex_version=self._get_codex_version(),
+            session_id=session_id,
+        )
+
+        inspection = self.inspect_session(session_id)
+        if not inspection["jsonl_files"] and not inspection["sqlite_thread"]:
+            result["errors"].append(f"Session {session_id} not found")
+            return result
+
+        manifest.detected_cwd = inspection["sqlite_thread"].get("cwd")
+
+        bundle_dir = os.path.dirname(output_path) or "."
+        os.makedirs(bundle_dir, exist_ok=True)
+
+        included_files = []
+        excluded_files = []
+
+        try:
+            bundle_structure = {
+                "inspection": {},
+                "sessions": {"raw_jsonl": []},
+                "index": {},
+                "sqlite": {},
+                "checksums": {},
+            }
+
+            all_content_for_scan = []
+
+            for jsonl_file_info in inspection["jsonl_files"]:
+                jsonl_path = jsonl_file_info["path"]
+                if os.path.exists(jsonl_path):
+                    arcname = f"sessions/raw_jsonl/{os.path.basename(jsonl_path)}"
+                    with open(jsonl_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        all_content_for_scan.append((arcname, content))
+
+            if inspection["session_index"]:
+                idx_path = self.session_index_path
+                if os.path.exists(idx_path):
+                    arcname = "index/session_index_records.jsonl"
+                    with open(idx_path, "r", encoding="utf-8") as f:
+                        filtered_lines = []
+                        for line in f:
+                            try:
+                                data = json.loads(line.strip())
+                                if data.get("id") == session_id:
+                                    filtered_lines.append(line)
+                            except json.JSONDecodeError:
+                                continue
+                    content = "".join(filtered_lines)
+                    all_content_for_scan.append((arcname, content))
+
+            if inspection["sqlite_thread"]:
+                arcname = "sqlite/state_db_matching_rows.json"
+                content = json.dumps({
+                    "schema_summary": "threads(id, cwd, sandbox_policy, ...)",
+                    "matching_rows": [inspection["sqlite_thread"]],
+                }, indent=2, ensure_ascii=False)
+                all_content_for_scan.append((arcname, content))
+
+            arcname = "inspection/inspect_report.json"
+            content = json.dumps(inspection, indent=2, ensure_ascii=False)
+            all_content_for_scan.append((arcname, content))
+
+            for arcname, content in all_content_for_scan:
+                sensitive = self._scan_sensitive_content(content, arcname)
+                if sensitive:
+                    result["sensitive_findings"].extend(sensitive)
+
+            if result["sensitive_findings"] and not allow_sensitive_content:
+                result["errors"].append(
+                    f"Sensitive content detected in bundle. Use --allow-sensitive-content to export anyway. "
+                    f"Found {len(result['sensitive_findings'])} potential sensitive patterns."
+                )
+                return result
+
+            with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for jsonl_file_info in inspection["jsonl_files"]:
+                    jsonl_path = jsonl_file_info["path"]
+                    if os.path.exists(jsonl_path):
+                        arcname = f"sessions/raw_jsonl/{os.path.basename(jsonl_path)}"
+                        zf.write(jsonl_path, arcname)
+                        included_files.append(arcname)
+                        bundle_structure["sessions"]["raw_jsonl"].append(arcname)
+                        bundle_structure["checksums"][arcname] = self._sha256_file(jsonl_path)
+
+                if inspection["session_index"]:
+                    idx_path = self.session_index_path
+                    if os.path.exists(idx_path):
+                        arcname = "index/session_index_records.jsonl"
+                        with open(idx_path, "r", encoding="utf-8") as f:
+                            filtered_lines = []
+                            for line in f:
+                                try:
+                                    data = json.loads(line.strip())
+                                    if data.get("id") == session_id:
+                                        filtered_lines.append(line)
+                                except json.JSONDecodeError:
+                                    continue
+                            temp_idx = f"{bundle_dir}/.tmp_session_index.jsonl"
+                            with open(temp_idx, "w", encoding="utf-8") as tmp:
+                                tmp.writelines(filtered_lines)
+                            if filtered_lines:
+                                zf.write(temp_idx, arcname)
+                                included_files.append(arcname)
+                                bundle_structure["index"]["session_index_records"] = arcname
+                                bundle_structure["checksums"][arcname] = self._sha256_file(temp_idx)
+                            os.unlink(temp_idx)
+
+                if inspection["sqlite_thread"]:
+                    sqlite_info = {
+                        "schema_summary": "threads(id, cwd, sandbox_policy, ...)",
+                        "matching_rows": [inspection["sqlite_thread"]],
+                    }
+                    temp_sqlite = f"{bundle_dir}/.tmp_state_db_rows.json"
+                    with open(temp_sqlite, "w", encoding="utf-8") as f:
+                        json.dump(sqlite_info, f, indent=2, ensure_ascii=False)
+                    arcname = "sqlite/state_db_matching_rows.json"
+                    zf.write(temp_sqlite, arcname)
+                    included_files.append(arcname)
+                    bundle_structure["sqlite"]["state_db_matching_rows"] = arcname
+                    bundle_structure["checksums"][arcname] = self._sha256_file(temp_sqlite)
+                    os.unlink(temp_sqlite)
+
+                temp_inspect = f"{bundle_dir}/.tmp_inspect.json"
+                with open(temp_inspect, "w", encoding="utf-8") as f:
+                    json.dump(inspection, f, indent=2, ensure_ascii=False)
+                arcname = "inspection/inspect_report.json"
+                zf.write(temp_inspect, arcname)
+                included_files.append(arcname)
+                bundle_structure["inspection"]["inspect_report"] = arcname
+                os.unlink(temp_inspect)
+
+                readme_content = """# Codex Session Migration Bundle
+
+## How to Import
+
+1. Copy this ZIP to the target machine
+2. Run: `python3 codex_workdir_migrate.py import-plan --bundle <this_file.zip> --codex-home ~/.codex --map-cwd "OLD=NEW"`
+3. Review the plan, then run: `python3 codex_workdir_migrate.py import-bundle --bundle <this_file.zip> --codex-home ~/.codex --map-cwd "OLD=NEW" --yes`
+
+## Bundle Contents
+
+- `sessions/raw_jsonl/`: Session conversation records
+- `index/`: Session index records
+- `sqlite/`: Database schema and matching thread rows
+- `inspection/`: Full inspection report
+
+## Security Notes
+
+- No authentication files are included
+- Review the MANIFEST.json for exact contents
+"""
+                zf.writestr("README_IMPORT.md", readme_content)
+
+                manifest.included_files = included_files
+                manifest.excluded_sensitive_files = excluded_files
+                manifest.bundle_structure = bundle_structure
+                manifest.checksums = bundle_structure.get("checksums", {})
+
+                zf.writestr("MANIFEST.json", json.dumps(manifest.to_dict(), indent=2, ensure_ascii=False))
+                
+                checksums_content = "\n".join(
+                    f"{checksum}  {path}" 
+                    for path, checksum in sorted(bundle_structure.get("checksums", {}).items())
+                )
+                zf.writestr("checksums/SHA256SUMS.txt", checksums_content)
+
+            result["success"] = True
+            result["bundle_path"] = output_path
+            result["manifest"] = manifest.to_dict()
+
+        except Exception as e:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+            result["errors"].append(f"Failed to create bundle: {e}")
+
+        return result
+
+    def check_import_target(self, session_id):
+        """Check if session already exists on target machine."""
+        target_info = {
+            "session_exists": False,
+            "jsonl_files": [],
+            "sqlite_record": None,
+            "session_index_record": None,
+        }
+
+        target_jsonl_files = self.find_session_file(session_id)
+        if target_jsonl_files:
+            target_info["session_exists"] = True
+            target_info["jsonl_files"] = target_jsonl_files
+
+        try:
+            if os.path.exists(self.state_db_path):
+                db = self._connect_state_db(readonly=True)
+                cursor = db.cursor()
+                cursor.execute("SELECT * FROM threads WHERE id = ?", (session_id,))
+                row = cursor.fetchone()
+                if row:
+                    cursor.execute("PRAGMA table_info(threads)")
+                    col_names = [c[1] for c in cursor.fetchall()]
+                    target_info["sqlite_record"] = dict(zip(col_names, row))
+                db.close()
+        except Exception:
+            pass
+
+        try:
+            if os.path.exists(self.session_index_path):
+                with open(self.session_index_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line.strip())
+                            if data.get("id") == session_id:
+                                target_info["session_index_record"] = data
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            pass
+
+        return target_info
+
+    def import_plan(self, bundle_path, cwd_mappings, policy=None):
+        """Generate detailed import plan from bundle."""
+        if policy is None:
+            policy = MigrationPolicy()
+
+        result = {
+            "success": False,
+            "bundle_contents": {},
+            "target_status": {},
+            "import_plan": {},
+            "files_to_backup": [],
+            "errors": [],
+            "warnings": [],
+            "source_session_id": None,
+            "target_session_id": None,
+            "session_exists_on_target": False,
+        }
+
+        if not os.path.exists(bundle_path):
+            result["errors"].append(f"Bundle not found: {bundle_path}")
+            return result
+
+        cwd_map = {}
+        for mapping in cwd_mappings:
+            if "=" in mapping:
+                old, new = mapping.split("=", 1)
+                cwd_map[old] = new
+
+        if len(cwd_map) > 1:
+            result["errors"].append(
+                "Multiple cwd_mappings not supported. Please provide exactly one --map-cwd."
+            )
+            return result
+
+        try:
+            with zipfile.ZipFile(bundle_path, "r") as zf:
+                manifest_str = zf.read("MANIFEST.json").decode("utf-8")
+                manifest_data = json.loads(manifest_str)
+                namelist = zf.namelist()
+
+                result["bundle_contents"] = {
+                    "tool_version": manifest_data.get("tool_version"),
+                    "export_time": manifest_data.get("export_time"),
+                    "session_id": manifest_data.get("session_id"),
+                    "detected_cwd": manifest_data.get("detected_cwd"),
+                    "included_files": manifest_data.get("included_files", []),
+                    "source_hostname": manifest_data.get("source_hostname"),
+                    "source_os": manifest_data.get("source_os"),
+                    "has_jsonl": any("sessions/raw_jsonl/" in m for m in namelist),
+                    "has_index": any("index/" in m for m in namelist),
+                    "has_sqlite": any("sqlite/" in m for m in namelist),
+                }
+
+                source_session_id = manifest_data.get("session_id")
+                result["source_session_id"] = source_session_id
+                result["target_session_id"] = source_session_id
+
+                target_info = self.check_import_target(source_session_id)
+
+                has_jsonl = target_info["session_exists"]
+                has_sqlite = target_info["sqlite_record"] is not None
+                has_index = target_info["session_index_record"] is not None
+                session_exists = has_jsonl or has_sqlite
+                result["session_exists_on_target"] = session_exists
+
+                if not has_jsonl and not has_sqlite and not has_index:
+                    result["target_status"] = {
+                        "status": "none",
+                        "message": "Session does not exist on target machine",
+                        "has_jsonl": False,
+                        "has_sqlite": False,
+                        "has_index": False,
+                    }
+                elif has_jsonl and has_sqlite and has_index:
+                    result["target_status"] = {
+                        "status": "complete",
+                        "message": "Session exists with JSONL, SQLite record, and index",
+                        "has_jsonl": True,
+                        "has_sqlite": True,
+                        "has_index": True,
+                        "jsonl_files": target_info["jsonl_files"],
+                        "sqlite_cwd": target_info["sqlite_record"].get("cwd"),
+                    }
+                else:
+                    missing = []
+                    if not has_jsonl:
+                        missing.append("jsonl")
+                    if not has_sqlite:
+                        missing.append("sqlite")
+                    if not has_index:
+                        missing.append("index")
+                    result["target_status"] = {
+                        "status": "incomplete",
+                        "message": f"Session exists but missing: {', '.join(missing)}",
+                        "has_jsonl": has_jsonl,
+                        "has_sqlite": has_sqlite,
+                        "has_index": has_index,
+                        "jsonl_files": target_info["jsonl_files"],
+                        "sqlite_record": target_info["sqlite_record"],
+                    }
+
+                target_jsonl_dir = os.path.join(self.sessions_dir, datetime.now().strftime("%Y/%m/%d"))
+                files_to_backup = []
+
+                if os.path.exists(self.state_db_path):
+                    files_to_backup.append(self.state_db_path)
+                    for ext in ["-wal", "-shm"]:
+                        wal_path = self.state_db_path + ext
+                        if os.path.exists(wal_path):
+                            files_to_backup.append(wal_path)
+                if os.path.exists(self.session_index_path):
+                    files_to_backup.append(self.session_index_path)
+                for jsonl_path in target_info.get("jsonl_files", []):
+                    if os.path.exists(jsonl_path):
+                        files_to_backup.append(jsonl_path)
+
+                planned_jsonl_updates = []
+                if any("sessions/raw_jsonl/" in m for m in namelist):
+                    planned_jsonl_updates.append({
+                        "action": "create",
+                        "target_dir": target_jsonl_dir,
+                        "cwd_mapping": bool(cwd_map),
+                        "affected_fields": ["session_meta.cwd", "turn_context.cwd"],
+                    })
+
+                planned_sqlite_updates = []
+                has_sqlite_in_bundle = any("sqlite/" in m for m in namelist)
+                
+                if has_sqlite_in_bundle:
+                    if not os.path.exists(self.state_db_path):
+                        result["errors"].append(
+                            "Bundle contains SQLite data but target state_5.sqlite does not exist. Import will fail. Initialize Codex on target machine first."
+                        )
+                    else:
+                        try:
+                            db = self._connect_state_db(readonly=True)
+                            cursor = db.cursor()
+                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
+                            if not cursor.fetchone():
+                                result["errors"].append(
+                                    "Bundle contains SQLite data but target has no 'threads' table. Import will fail. Initialize Codex on target machine first."
+                                )
+                            elif cwd_map:
+                                planned_sqlite_updates.append({
+                                    "action": "update",
+                                    "table": "threads",
+                                    "fields": ["cwd", "sandbox_policy"],
+                                    "cwd_mapping": cwd_map,
+                                })
+                            db.close()
+                        except Exception as e:
+                            result["warnings"].append(
+                                f"Could not check target SQLite: {e}. SQLite import may fail."
+                            )
+                elif cwd_map:
+                    planned_sqlite_updates.append({
+                        "action": "update",
+                        "table": "threads",
+                        "fields": ["cwd", "sandbox_policy"],
+                        "cwd_mapping": cwd_map,
+                    })
+
+                planned_index_updates = []
+                if any("index/" in m for m in namelist):
+                    planned_index_updates.append({
+                        "action": "update" if has_index else "create",
+                        "target_file": self.session_index_path,
+                    })
+
+                risks = []
+                if cwd_map and manifest_data.get("detected_cwd") not in cwd_map:
+                    risks.append(f"Detected CWD '{manifest_data.get('detected_cwd')}' not in cwd_mappings")
+
+                if session_exists:
+                    risks.append("Target machine has existing session data - will be overwritten")
+
+                if not cwd_map:
+                    risks.append("No cwd_mappings provided - imported session will keep original CWD")
+
+                result["import_plan"] = {
+                    "session_id": source_session_id,
+                    "cwd_mappings": cwd_map,
+                    "will_create_jsonl": bool(planned_jsonl_updates),
+                    "will_update_sqlite": bool(planned_sqlite_updates),
+                    "will_update_index": bool(planned_index_updates),
+                    "target_jsonl_dir": target_jsonl_dir,
+                    "planned_jsonl_updates": planned_jsonl_updates,
+                    "planned_sqlite_updates": planned_sqlite_updates,
+                    "planned_index_updates": planned_index_updates,
+                    "backup_required": True,
+                    "risks": risks,
+                    "policy": self._policy_dict(policy),
+                }
+
+                result["files_to_backup"] = files_to_backup
+                if not result["errors"]:
+                    result["success"] = True
+
+        except Exception as e:
+            result["errors"].append(f"Failed to read bundle: {e}")
+
+        return result
+
+    def import_bundle(
+        self,
+        bundle_path,
+        cwd_mappings,
+        backup_dir,
+        mode="skip",
+        dry_run=True,
+        policy=None,
+        allow_missing_cwd=False,
+        no_backup=False,
+        on_conflict="abort",
+        new_session_id=None,
+    ):
+        """Import bundle to target machine."""
+        if policy is None:
+            policy = MigrationPolicy()
+
+        result = {
+            "dry_run": dry_run,
+            "success": False,
+            "backup": None,
+            "imported_files": [],
+            "errors": [],
+            "warnings": [],
+            "source_session_id": None,
+            "target_session_id": None,
+            "id_rewrite_mode": "none",
+        }
+
+        if not os.path.exists(bundle_path):
+            result["errors"].append(f"Bundle not found: {bundle_path}")
+            return result
+
+        if dry_run:
+            result["note"] = "Dry run - no files written. Use --yes to actually import."
+
+        cwd_map = {}
+        for mapping in cwd_mappings:
+            if "=" in mapping:
+                old, new = mapping.split("=", 1)
+                cwd_map[old] = new
+
+        if len(cwd_map) > 1:
+            result["errors"].append(
+                "Multiple cwd_mappings not supported. Please provide exactly one --map-cwd."
+            )
+            return result
+
+        if not allow_missing_cwd and not dry_run and cwd_map:
+            for old_cwd, new_cwd in cwd_map.items():
+                if new_cwd and not os.path.exists(new_cwd):
+                    result["errors"].append(
+                        f"Target directory does not exist: {new_cwd}. Use --allow-missing-cwd to allow."
+                    )
+                    return result
+
+        backup_manifest = {"timestamp": datetime.now().strftime("%Y%m%d_%H%M%S_%f"), "files_backed_up": []}
+
+        try:
+            with zipfile.ZipFile(bundle_path, "r") as zf:
+                manifest_str = zf.read("MANIFEST.json").decode("utf-8")
+                manifest_data = json.loads(manifest_str)
+                source_session_id = manifest_data.get("session_id")
+                result["source_session_id"] = source_session_id
+
+                target_info = self.check_import_target(source_session_id)
+
+                has_jsonl = target_info["session_exists"]
+                has_sqlite = target_info["sqlite_record"] is not None
+                has_index = target_info["session_index_record"] is not None
+                session_exists = has_jsonl or has_sqlite
+
+                effective_on_conflict = on_conflict
+                if mode == "overwrite" and on_conflict == "abort":
+                    effective_on_conflict = "overwrite"
+
+                target_session_id = source_session_id
+                id_rewrite_mode = "none"
+
+                if new_session_id:
+                    target_session_id = new_session_id
+                    id_rewrite_mode = "explicit"
+                elif effective_on_conflict == "import-as-new":
+                    target_session_id = str(uuid.uuid4())
+                    id_rewrite_mode = "auto"
+
+                result["target_session_id"] = target_session_id
+                result["id_rewrite_mode"] = id_rewrite_mode
+
+                if target_session_id != source_session_id:
+                    target_info_new = self.check_import_target(target_session_id)
+                    has_jsonl_new = target_info_new["session_exists"]
+                    has_sqlite_new = target_info_new["sqlite_record"] is not None
+                    has_index_new = target_info_new["session_index_record"] is not None
+                    target_session_exists = has_jsonl_new or has_sqlite_new or has_index_new
+
+                    if target_session_exists:
+                        result["errors"].append(
+                            f"Target session id '{target_session_id}' already exists on target. Use a different --new-session-id or --on-conflict overwrite."
+                        )
+                        return result
+
+                if session_exists and effective_on_conflict == "abort":
+                    result["errors"].append(
+                        f"Session {source_session_id} already exists on target. Use --on-conflict overwrite or import-as-new."
+                    )
+                    return result
+
+                if mode == "merge":
+                    result["errors"].append("Mode 'merge' is not yet implemented.")
+                    return result
+
+                if session_exists and mode == "skip" and id_rewrite_mode == "none" and effective_on_conflict != "overwrite":
+                    result["errors"].append(
+                        f"Session {source_session_id} already exists. Use --mode overwrite, --on-conflict overwrite, or --on-conflict import-as-new."
+                    )
+                    return result
+
+                sqlite_member = "sqlite/state_db_matching_rows.json"
+                has_sqlite_in_bundle = sqlite_member in zf.namelist()
+                
+                bundle_sqlite_data = None
+                if has_sqlite_in_bundle:
+                    bundle_sqlite_data = json.loads(zf.read(sqlite_member).decode("utf-8"))
+                    bundle_rows = bundle_sqlite_data.get("matching_rows", [])
+                    
+                    if not os.path.exists(self.state_db_path):
+                        result["errors"].append(
+                            f"Bundle contains SQLite data but target state_5.sqlite does not exist. "
+                            f"Import will fail. Initialize Codex on target machine first."
+                        )
+                        return result
+                    
+                    try:
+                        db = self._connect_state_db(readonly=True)
+                        cursor = db.cursor()
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
+                        if not cursor.fetchone():
+                            result["errors"].append(
+                                f"Bundle contains SQLite data but target has no 'threads' table. "
+                                f"Import will fail. Initialize Codex on target machine first."
+                            )
+                            db.close()
+                            return result
+                        
+                        cursor.execute("PRAGMA table_info(threads)")
+                        not_null_columns = set()
+                        for row in cursor.fetchall():
+                            col_name = row[1]
+                            not_null = row[3]
+                            dflt_value = row[4]
+                            if not_null and dflt_value is None:
+                                not_null_columns.add(col_name)
+                        
+                        if bundle_rows and not_null_columns:
+                            missing_not_null = []
+                            bundle_row = bundle_rows[0]
+                            for col in not_null_columns:
+                                if col not in bundle_row or bundle_row.get(col) is None:
+                                    missing_not_null.append(col)
+                            
+                            if missing_not_null:
+                                result["errors"].append(
+                                    f"Bundle SQLite row missing NOT NULL columns without defaults: {missing_not_null}. "
+                                    f"Import will fail. Ensure bundle contains all required columns."
+                                )
+                                db.close()
+                                return result
+                        
+                        db.close()
+                    except Exception as e:
+                        result["errors"].append(
+                            f"Failed to check target SQLite: {e}. Import will fail."
+                        )
+                        return result
+
+                files_to_backup = []
+                if os.path.exists(self.state_db_path):
+                    files_to_backup.append(self.state_db_path)
+                    for ext in ["-wal", "-shm"]:
+                        wal_path = self.state_db_path + ext
+                        if os.path.exists(wal_path):
+                            files_to_backup.append(wal_path)
+                if os.path.exists(self.session_index_path):
+                    files_to_backup.append(self.session_index_path)
+                for jsonl_path in target_info.get("jsonl_files", []):
+                    if os.path.exists(jsonl_path):
+                        files_to_backup.append(jsonl_path)
+
+                if not dry_run and not no_backup and backup_dir and files_to_backup:
+                    os.makedirs(backup_dir, exist_ok=True)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    backup_path = os.path.join(backup_dir, f"import_backup_{timestamp}")
+                    os.makedirs(backup_path, exist_ok=True)
+
+                    backup_manifest = {
+                        "timestamp": timestamp,
+                        "files_backed_up": [],
+                    }
+
+                    for src_path in files_to_backup:
+                        if os.path.exists(src_path):
+                            dst = os.path.join(backup_path, os.path.basename(src_path))
+                            shutil.copy2(src_path, dst)
+                            stat = os.stat(src_path)
+                            backup_manifest["files_backed_up"].append({
+                                "original_path": src_path,
+                                "backup_path": dst,
+                                "size": stat.st_size,
+                                "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                                "sha256": self._sha256_file(src_path),
+                            })
+
+                    manifest_path = os.path.join(backup_path, "MANIFEST.json")
+                    with open(manifest_path, "w", encoding="utf-8") as f:
+                        json.dump(backup_manifest, f, indent=2, ensure_ascii=False)
+                    result["backup"] = backup_path
+                elif not dry_run and not no_backup and files_to_backup and not backup_dir:
+                    result["warnings"].append(
+                        "No backup directory provided. Proceeding without backup."
+                    )
+
+                jsonl_members = [m for m in zf.namelist() if m.startswith("sessions/raw_jsonl/")]
+                
+                if effective_on_conflict == "overwrite" and target_info["jsonl_files"] and not dry_run and id_rewrite_mode == "none":
+                    for old_jsonl in target_info["jsonl_files"]:
+                        if os.path.exists(old_jsonl):
+                            os.unlink(old_jsonl)
+                            result["imported_files"].append({
+                                "type": "jsonl",
+                                "action": "deleted_old",
+                                "path": old_jsonl,
+                            })
+
+                for member in jsonl_members:
+                    content_bytes = zf.read(member)
+                    basename = os.path.basename(member)
+
+                    if id_rewrite_mode != "none":
+                        basename = basename.replace(source_session_id, target_session_id)
+
+                    target_dir = os.path.join(self.sessions_dir, datetime.now().strftime("%Y/%m/%d"))
+                    target_path = os.path.join(target_dir, basename)
+
+                    if not dry_run:
+                        os.makedirs(target_dir, exist_ok=True)
+
+                    if (cwd_map or id_rewrite_mode != "none") and not dry_run:
+                        content_str = content_bytes.decode("utf-8")
+                        updated_lines = []
+                        changes_made = 0
+                        warnings = []
+
+                        for line in content_str.splitlines(keepends=True):
+                            stripped = line.strip()
+                            if not stripped:
+                                updated_lines.append(line)
+                                continue
+                            try:
+                                data = json.loads(stripped)
+                                updated_data = data
+
+                                if cwd_map:
+                                    updated_data, categories = self._update_json_line(
+                                        data, list(cwd_map.keys())[0], list(cwd_map.values())[0], policy
+                                    )
+                                    if categories:
+                                        changes_made += len(categories)
+
+                                if id_rewrite_mode != "none":
+                                    updated_data = self._rewrite_session_id_in_json(
+                                        updated_data, source_session_id, target_session_id
+                                    )
+
+                                updated_lines.append(
+                                    json.dumps(updated_data, ensure_ascii=False) + "\n"
+                                )
+                            except json.JSONDecodeError as e:
+                                warnings.append(f"Could not parse JSON line: {e}")
+                                updated_lines.append(line)
+
+                        if warnings:
+                            result["warnings"].extend(warnings)
+
+                        temp_path = target_path + ".tmp"
+                        with open(temp_path, "w", encoding="utf-8") as f:
+                            f.writelines(updated_lines)
+                        os.replace(temp_path, target_path)
+                    else:
+                        if not dry_run:
+                            with open(target_path, "wb") as f:
+                                f.write(content_bytes)
+
+                    result["imported_files"].append({
+                        "type": "jsonl",
+                        "source": member,
+                        "target": target_path,
+                        "cwd_mapped": bool(cwd_map),
+                        "session_id_rewritten": id_rewrite_mode != "none",
+                    })
+
+                sqlite_member = "sqlite/state_db_matching_rows.json"
+                if sqlite_member in zf.namelist():
+                    sqlite_data = json.loads(zf.read(sqlite_member).decode("utf-8"))
+                    rows = sqlite_data.get("matching_rows", [])
+
+                    if rows:
+                        thread_data = copy.deepcopy(rows[0])
+
+                        if cwd_map:
+                            old_cwd = list(cwd_map.keys())[0]
+                            new_cwd = list(cwd_map.values())[0]
+
+                            if thread_data.get("cwd") == old_cwd:
+                                thread_data["cwd"] = new_cwd
+
+                            sandbox_policy = thread_data.get("sandbox_policy", "")
+                            rewritten_policy, sandbox_changed = self._rewrite_sandbox_policy(
+                                sandbox_policy, old_cwd, new_cwd, policy
+                            )
+                            if sandbox_changed:
+                                thread_data["sandbox_policy"] = rewritten_policy
+
+                        if id_rewrite_mode != "none":
+                            thread_data["id"] = target_session_id
+                            if "rollout_path" in thread_data:
+                                thread_data["rollout_path"] = thread_data["rollout_path"].replace(
+                                    source_session_id, target_session_id
+                                )
+
+                        if not dry_run:
+                            db = self._connect_state_db(readonly=False)
+                            cursor = db.cursor()
+
+                            cursor.execute("PRAGMA table_info(threads)")
+                            target_columns = {row[1] for row in cursor.fetchall()}
+                            required_columns = {"id"}
+
+                            missing_required = required_columns - target_columns
+                            if missing_required:
+                                result["errors"].append(
+                                    f"Target threads table missing required columns: {missing_required}"
+                                )
+                                db.close()
+                                return result
+
+                            cursor.execute("PRAGMA table_info(threads)")
+                            not_null_columns = set()
+                            for row in cursor.fetchall():
+                                col_name = row[1]
+                                not_null = row[3]
+                                dflt_value = row[4]
+                                if not_null and dflt_value is None:
+                                    not_null_columns.add(col_name)
+
+                            cursor.execute(
+                                "SELECT COUNT(*) FROM threads WHERE id = ?", (target_session_id,)
+                            )
+                            exists = cursor.fetchone()[0] > 0
+
+                            if exists:
+                                update_columns = []
+                                update_values = []
+                                if "cwd" in target_columns and "cwd" in thread_data:
+                                    update_columns.append("cwd = ?")
+                                    update_values.append(thread_data["cwd"])
+                                if "sandbox_policy" in target_columns and "sandbox_policy" in thread_data:
+                                    update_columns.append("sandbox_policy = ?")
+                                    update_values.append(thread_data["sandbox_policy"])
+                                if "updated_at" in target_columns and "updated_at" in thread_data:
+                                    update_columns.append("updated_at = ?")
+                                    update_values.append(thread_data["updated_at"])
+
+                                if update_columns:
+                                    update_values.append(target_session_id)
+                                    cursor.execute(
+                                        f"UPDATE threads SET {', '.join(update_columns)} WHERE id = ?",
+                                        update_values
+                                    )
+                            else:
+                                insert_columns = []
+                                insert_placeholders = []
+                                insert_values = []
+
+                                for col in sorted(target_columns):
+                                    if col in thread_data and thread_data[col] is not None:
+                                        insert_columns.append(col)
+                                        insert_placeholders.append("?")
+                                        insert_values.append(thread_data[col])
+
+                                if insert_columns and "id" in insert_columns:
+                                    cursor.execute(
+                                        f"INSERT INTO threads ({', '.join(insert_columns)}) VALUES ({', '.join(insert_placeholders)})",
+                                        insert_values
+                                    )
+                                else:
+                                    result["errors"].append(
+                                        "Cannot insert thread: no valid columns or missing id"
+                                    )
+                                    db.close()
+                                    return result
+
+                            db.commit()
+                            db.close()
+
+                        result["imported_files"].append({
+                            "type": "sqlite",
+                            "session_id": target_session_id,
+                            "cwd_updated": bool(cwd_map),
+                            "session_id_rewritten": id_rewrite_mode != "none",
+                        })
+
+                index_member = "index/session_index_records.jsonl"
+                if index_member in zf.namelist():
+                    index_content = zf.read(index_member).decode("utf-8")
+
+                    index_path = self.session_index_path
+                    existing_records = {}
+
+                    if os.path.exists(index_path):
+                        with open(index_path, "r", encoding="utf-8") as f:
+                            for line in f:
+                                try:
+                                    record = json.loads(line.strip())
+                                    if record.get("id"):
+                                        existing_records[record["id"]] = line
+                                except json.JSONDecodeError:
+                                    continue
+
+                    session_index_record = None
+                    for line in index_content.splitlines():
+                        if line.strip():
+                            try:
+                                record = json.loads(line.strip())
+                                if record.get("id") == source_session_id:
+                                    session_index_record = record
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+
+                    if session_index_record:
+                        if cwd_map:
+                            old_cwd = list(cwd_map.keys())[0]
+                            new_cwd = list(cwd_map.values())[0]
+
+                            path_tokens = {"cwd", "path", "workdir", "dir", "root", "directory"}
+                            non_text_fields = {"id", "title", "message", "summary", "description"}
+
+                            for field_name in list(session_index_record.keys()):
+                                if field_name.lower() in non_text_fields:
+                                    continue
+                                field_lower = field_name.lower()
+                                if any(token in field_lower for token in path_tokens):
+                                    if isinstance(session_index_record[field_name], str):
+                                        if session_index_record[field_name] == old_cwd:
+                                            session_index_record[field_name] = new_cwd
+                                        elif (
+                                            policy and policy.rewrite_prefix_paths
+                                            and session_index_record[field_name].startswith(old_cwd + os.sep)
+                                        ):
+                                            suffix = session_index_record[field_name][len(old_cwd):]
+                                            session_index_record[field_name] = new_cwd + suffix
+
+                        if id_rewrite_mode != "none":
+                            session_index_record["id"] = target_session_id
+                            if "rollout_path" in session_index_record:
+                                session_index_record["rollout_path"] = session_index_record["rollout_path"].replace(
+                                    source_session_id, target_session_id
+                                )
+
+                        if mode == "skip" and target_session_id in existing_records:
+                            result["imported_files"].append({
+                                "type": "session_index",
+                                "action": "skipped",
+                                "reason": "session exists",
+                            })
+                        else:
+                            existing_records[target_session_id] = json.dumps(session_index_record, ensure_ascii=False) + "\n"
+
+                            if not dry_run:
+                                temp_path = index_path + ".tmp"
+                                with open(temp_path, "w", encoding="utf-8") as f:
+                                    for rec_line in existing_records.values():
+                                        f.write(rec_line)
+                                os.replace(temp_path, index_path)
+
+                            result["imported_files"].append({
+                                "type": "session_index",
+                                "action": "updated",
+                                "session_id": target_session_id,
+                                "session_id_rewritten": id_rewrite_mode != "none",
+                            })
+
+                result["success"] = True
+
+        except Exception as e:
+            result["errors"].append(f"Import failed: {e}")
+
+        return result
+
 
 def _build_policy_from_args(args):
     return MigrationPolicy(
@@ -730,6 +1802,54 @@ def main():
     verify_parser.add_argument("--codex-home", help="Custom Codex home (default: ~/.codex)")
     _add_policy_args(verify_parser)
 
+    export_parser = subparsers.add_parser("export-bundle", help="Export session bundle for cross-machine migration")
+    export_parser.add_argument("--session", required=True, help="Session ID")
+    export_parser.add_argument("--codex-home", help="Custom Codex home (default: ~/.codex)")
+    export_parser.add_argument("--out", required=True, help="Output ZIP path")
+    export_parser.add_argument("--allow-sensitive-content", action="store_true", help="Allow export even if sensitive content is detected")
+
+    import_plan_parser = subparsers.add_parser("import-plan", help="Generate import plan from bundle")
+    import_plan_parser.add_argument("--bundle", required=True, help="Bundle ZIP path")
+    import_plan_parser.add_argument("--codex-home", help="Custom Codex home (default: ~/.codex)")
+    import_plan_parser.add_argument(
+        "--map-cwd",
+        action="append",
+        default=[],
+        help="CWD mapping in format OLD=NEW (single mapping supported)",
+    )
+    _add_policy_args(import_plan_parser)
+
+    import_parser = subparsers.add_parser("import-bundle", help="Import session bundle to target machine")
+    import_parser.add_argument("--bundle", required=True, help="Bundle ZIP path")
+    import_parser.add_argument("--codex-home", help="Custom Codex home (default: ~/.codex)")
+    import_parser.add_argument(
+        "--map-cwd",
+        action="append",
+        default=[],
+        help="CWD mapping in format OLD=NEW (single mapping supported)",
+    )
+    import_parser.add_argument("--backup-dir", help="Backup directory for target files")
+    import_parser.add_argument(
+        "--mode",
+        choices=["skip", "overwrite", "merge"],
+        default="skip",
+        help="Conflict resolution mode: skip=don't overwrite existing, overwrite=replace, merge=not implemented",
+    )
+    import_parser.add_argument("--yes", action="store_true", help="Actually write changes")
+    import_parser.add_argument("--no-backup", action="store_true", help="Skip backup (use with caution)")
+    import_parser.add_argument("--allow-missing-cwd", action="store_true", help="Allow importing to non-existent target directory")
+    import_parser.add_argument(
+        "--on-conflict",
+        choices=["abort", "overwrite", "import-as-new"],
+        default="abort",
+        help="Conflict handling when target has same session id: abort=fail, overwrite=replace, import-as-new=create new session",
+    )
+    import_parser.add_argument(
+        "--new-session-id",
+        help="New session ID to use (use 'auto' for auto-generated UUID, or specify explicit ID)",
+    )
+    _add_policy_args(import_parser)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -769,6 +1889,49 @@ def main():
     if args.command == "verify":
         policy = _build_policy_from_args(args)
         result = migrator.verify(args.session, args.old_cwd, args.new_cwd, policy)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result["success"] else 1
+
+    if args.command == "export-bundle":
+        result = migrator.export_bundle(
+            args.session, 
+            args.out, 
+            allow_sensitive_content=getattr(args, "allow_sensitive_content", False)
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result["success"] else 1
+
+    if args.command == "import-plan":
+        policy = _build_policy_from_args(args)
+        result = migrator.import_plan(args.bundle, args.map_cwd, policy=policy)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result["success"] else 1
+
+    if args.command == "import-bundle":
+        if args.yes and not args.backup_dir and not getattr(args, "no_backup", False):
+            print(json.dumps({
+                "success": False,
+                "errors": ["--yes requires either --backup-dir or --no-backup (use with caution)"],
+            }, indent=2, ensure_ascii=False))
+            return 1
+        
+        policy = _build_policy_from_args(args)
+        new_session_id = getattr(args, "new_session_id", None)
+        if new_session_id == "auto":
+            new_session_id = str(uuid.uuid4())
+        
+        result = migrator.import_bundle(
+            args.bundle,
+            args.map_cwd,
+            args.backup_dir,
+            mode=args.mode,
+            dry_run=not args.yes,
+            policy=policy,
+            allow_missing_cwd=getattr(args, "allow_missing_cwd", False),
+            no_backup=getattr(args, "no_backup", False),
+            on_conflict=getattr(args, "on_conflict", "abort"),
+            new_session_id=new_session_id,
+        )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result["success"] else 1
 
