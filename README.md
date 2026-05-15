@@ -191,7 +191,24 @@ bundle.zip/
 **冲突策略**：
 - `--mode skip`（默认）：如果目标机器已有该会话，则跳过
 - `--mode overwrite`：备份后覆盖已有会话
-- `--mode merge`：暂不支持
+- `--mode abort`（默认）：如果目标机器已有该会话，则报错退出
+
+**导入时新建 session ID**：
+- `--on-conflict import-as-new`：即使目标机器已有该会话，导入为新会话
+- `--new-session-id auto`：自动生成新 session ID
+- `--new-session-id <explicit-id>`：使用指定的 session ID
+
+**备份控制**：
+- `--no-backup`：跳过备份（危险，仅在确信数据可恢复时使用）
+
+**其他选项**：
+- `--allow-missing-cwd`：允许源 bundle 中缺少 CWD 信息的情况
+
+**Preflight 检查**：
+- 敏感内容扫描（邮箱、云盘路径、中文路径）
+- SQLite schema 完整性检查（NOT NULL 约束风险）
+- 目标 session ID 冲突检测
+- SHA256SUMS.txt 校验和验证
 
 **真实写入需加 `--yes`**：
 ```bash

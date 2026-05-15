@@ -19,15 +19,26 @@ ENV/
 
 # Codex specific
 backups/
+backup_*/
+import_backups/
+import_backup_*/
 reports/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+state_5.sqlite
+state_5.sqlite-wal
+state_5.sqlite-shm
+session_index.jsonl
+sessions/
+archived_sessions/
+rollout-*.jsonl
 
 # Sensitive local review files
 AUDIT_REPORT.md
 docs/inspection_report.md
-docs/migration_design.md
+docs/*inspection*report*.md
+docs/*audit*report*.md
 
 # Test / tool caches
 .pytest_cache/
@@ -36,7 +47,16 @@ docs/migration_design.md
 
 # Local fixtures / archives
 *.zip
+*.tar.gz
+release/
+exported_bundles/
 
 # Temporary files
 *.tmp
+.tmp_*
 *.bak
+*.orig
+
+# Environment files
+.env
+.env.*
