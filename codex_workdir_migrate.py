@@ -103,6 +103,13 @@ class BundleManifest:
 
 
 class CodexSessionMigrator:
+    @staticmethod
+    def _valid_session_id(session_id):
+        # IDs become part of filenames; accept non-UUID IDs but never paths.
+        return isinstance(session_id, str) and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", session_id
+        ) is not None
+
     def __init__(self, codex_home=None):
         self.codex_home = codex_home or os.path.expanduser("~/.codex")
         self.sessions_dir = os.path.join(self.codex_home, "sessions")
@@ -1090,6 +1097,10 @@ class CodexSessionMigrator:
                 result["source_session_id"] = source_session_id
                 result["target_session_id"] = source_session_id
 
+                if not self._valid_session_id(source_session_id):
+                    result["errors"].append("Invalid bundle session ID: expected a filename-safe ID.")
+                    return result
+
                 target_info = self.check_import_target(source_session_id)
 
                 has_jsonl = target_info["session_exists"]
@@ -1272,6 +1283,10 @@ class CodexSessionMigrator:
         if dry_run:
             result["note"] = "Dry run - no files written. Use --yes to actually import."
 
+        if new_session_id is not None and not self._valid_session_id(new_session_id):
+            result["errors"].append("Invalid new session ID: expected a filename-safe ID.")
+            return result
+
         cwd_map = {}
         for mapping in cwd_mappings:
             if "=" in mapping:
@@ -1301,6 +1316,10 @@ class CodexSessionMigrator:
                 source_session_id = manifest_data.get("session_id")
                 result["source_session_id"] = source_session_id
 
+                if not self._valid_session_id(source_session_id):
+                    result["errors"].append("Invalid bundle session ID: expected a filename-safe ID.")
+                    return result
+
                 target_info = self.check_import_target(source_session_id)
 
                 has_jsonl = target_info["session_exists"]
@@ -1324,6 +1343,33 @@ class CodexSessionMigrator:
 
                 result["target_session_id"] = target_session_id
                 result["id_rewrite_mode"] = id_rewrite_mode
+
+                # Validate every destination before backups, deletions or writes.
+                jsonl_members = [m for m in zf.namelist() if m.startswith("sessions/raw_jsonl/")]
+                target_dir = os.path.join(self.sessions_dir, datetime.now().strftime("%Y/%m/%d"))
+                home_real = os.path.realpath(self.codex_home)
+                jsonl_targets = []
+                for member in jsonl_members:
+                    basename = os.path.basename(member)
+                    if id_rewrite_mode != "none":
+                        # Rollout filenames end in the ID; prefix text and the
+                        # .jsonl extension may also contain short source IDs.
+                        if basename.endswith(".jsonl"):
+                            stem = basename[:-len(".jsonl")]
+                            if stem.endswith(source_session_id):
+                                stem = stem[:-len(source_session_id)] + target_session_id
+                            basename = stem + ".jsonl"
+                    target_path = os.path.join(target_dir, basename)
+                    if (
+                        not basename.endswith(".jsonl")
+                        or "/" in basename or "\\" in basename or ":" in basename
+                        or any(ord(char) < 32 or ord(char) == 127 for char in basename)
+                        or os.path.commonpath([home_real, os.path.realpath(target_path)]) != home_real
+                        or os.path.commonpath([home_real, os.path.realpath(target_path + ".tmp")]) != home_real
+                    ):
+                        result["errors"].append("Unsafe bundle JSONL destination.")
+                        return result
+                    jsonl_targets.append((member, target_path))
 
                 if target_session_id != source_session_id:
                     target_info_new = self.check_import_target(target_session_id)
@@ -1458,8 +1504,6 @@ class CodexSessionMigrator:
                         "No backup directory provided. Proceeding without backup."
                     )
 
-                jsonl_members = [m for m in zf.namelist() if m.startswith("sessions/raw_jsonl/")]
-                
                 if effective_on_conflict == "overwrite" and target_info["jsonl_files"] and not dry_run and id_rewrite_mode == "none":
                     for old_jsonl in target_info["jsonl_files"]:
                         if os.path.exists(old_jsonl):
@@ -1470,15 +1514,8 @@ class CodexSessionMigrator:
                                 "path": old_jsonl,
                             })
 
-                for member in jsonl_members:
+                for member, target_path in jsonl_targets:
                     content_bytes = zf.read(member)
-                    basename = os.path.basename(member)
-
-                    if id_rewrite_mode != "none":
-                        basename = basename.replace(source_session_id, target_session_id)
-
-                    target_dir = os.path.join(self.sessions_dir, datetime.now().strftime("%Y/%m/%d"))
-                    target_path = os.path.join(target_dir, basename)
 
                     if not dry_run:
                         os.makedirs(target_dir, exist_ok=True)
