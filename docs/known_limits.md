@@ -18,7 +18,7 @@ v0.2.1
 - ✅ import-bundle - 执行导入（支持 dry-run）
 - ✅ 敏感文件排除
 - ✅ 敏感内容扫描
-- ✅ 校验和验证
+- ✅ 导出 SHA256 校验和供人工审计（导入不自动校验）
 
 ### 安全特性
 - ✅ --yes 需要 --backup-dir 或 --no-backup
@@ -93,13 +93,13 @@ v0.2.1
 
 ### 6. 会话 ID 格式
 
-**限制**: 仅支持标准 UUID 格式
+**限制**: 导入 ID 必须可安全用于文件名；不要求 UUID 格式
 
-**说明**: 当前工具假设会话 ID 为 UUID 格式。
+**说明**: 导入支持 UUID 和非 UUID ID。ID 必须以 ASCII 字母或数字开头，其余字符仅限 ASCII 字母、数字、点、下划线和连字符。空 ID、绝对路径、路径分隔符和控制字符会被拒绝。
 
 **影响**:
-- 非标准格式的会话 ID 可能无法识别
-- 某些归档会话可能使用不同格式
+- 不符合上述文件名规则的 bundle ID 或显式新 ID 无法导入
+- JSONL 目标路径会在写入前检查；指向 Codex home 外的符号链接目标会被拒绝
 
 **建议**: 在 `inspect` 阶段确认会话 ID 格式正确。
 
@@ -141,10 +141,9 @@ v0.2.1
 
 ### Q: 迁移后 Codex 无法启动？
 
-A: 可能备份被覆盖或迁移损坏数据。使用备份恢复：
-```bash
-cp -r backups/backup_YYYYMMDD_HHMMSS/* ~/.codex/
-```
+A: 先关闭所有访问目标 Codex home 的程序。备份文件按 basename 平铺保存，不能把整个备份目录直接复制到 Codex home。检查备份的 `MANIFEST.json`：本地迁移使用 `files`，导入备份使用 `files_backed_up`；每项记录 `backup_path`、`original_path` 和 `sha256`。人工确认原路径属于要恢复的目标 home、备份校验和正确，再将各文件复制回各自的原路径（JSONL 通常位于多层 `sessions/` 目录）。
+
+恢复新导入的数据还可能需要人工删除本次新增的 JSONL；备份仅包含原先存在的文件，不是自动回滚工具。避免在 Codex 或 SQLite 仍运行时复制数据库/WAL/SHM。当前没有跨文件事务回滚或在线数据库备份保证。
 
 ### Q: 会话在 Codex 中不可见？
 

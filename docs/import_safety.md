@@ -97,16 +97,16 @@
 
 ## 备份恢复
 
-如果导入出现问题，使用备份恢复：
+如果导入出现问题，先关闭所有使用目标 Codex home 的程序，再人工恢复：
 
-```bash
-# 找到备份目录
-ls ~/codex_import_backups/
+1. 找到本次 `import_backup_YYYYMMDD_HHMMSS_ffffff/MANIFEST.json`。备份文件按 basename 平铺保存，不包含原来的 `sessions/` 目录层级。
+2. 导入 manifest 的 `files_backed_up` 数组记录每个文件的 `backup_path`、`original_path` 和 `sha256`（本地迁移备份使用 `files` 数组）。先验证备份哈希，并确认原路径属于本次目标 home。
+3. 将每个备份文件复制回其对应的原路径；不要把平铺的 JSONL 直接复制到 home 根目录。
+4. 备份只保存原先存在的文件。若本次导入新增了 JSONL，人工检查导入结果中的路径并移除对应新增文件，避免恢复后仍保留重复会话。
 
-# 复制备份文件回原位置
-cp backup_YYYYMMDD_HHMMSS/sessions/... ~/.codex/sessions/
-cp backup_YYYYMMDD_HHMMSS/state_5.sqlite ~/.codex/
-```
+没有自动回滚命令或跨 JSONL/SQLite/index 的事务保证。活跃 SQLite 的数据库/WAL/SHM 复制不保证一致性；恢复时必须停止写入，先在隔离 fixture 验证。
+
+Bundle 的 SHA256SUMS.txt 和 manifest checksums 仅供人工审计；导入当前不自动校验，不能把导入成功当成完整性认证。
 
 ## 风险提示
 

@@ -199,7 +199,7 @@ bundle.zip/
 
 **导入时新建 session ID**：
 - `--new-session-id auto`：自动生成新 session ID
-- `--new-session-id <explicit-id>`：使用指定的 session ID
+- `--new-session-id <explicit-id>`：使用指定的 session ID（UUID 或非 UUID；以 ASCII 字母/数字开头，其余字符仅限 ASCII 字母/数字、`.`、`_`、`-`；禁止路径）
 
 **备份控制**：
 - `--no-backup`：跳过备份（危险，仅在确信数据可恢复时使用）
