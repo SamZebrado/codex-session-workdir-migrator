@@ -116,6 +116,8 @@ class ImportPathSafetyTests(unittest.TestCase):
     def test_source_ids_overlapping_extension_preserve_jsonl_suffix(self):
         for source_id in ["jsonl", "l"]:
             with self.subTest(source_id=source_id):
+                self.home = self.root / ("home-" + source_id)
+                self.home.mkdir()
                 self.bundle_for(session_id=source_id, member=f"sessions/raw_jsonl/rollout-{source_id}.jsonl")
                 target_id = "target-" + source_id
                 result = self.imported(new_session_id=target_id, dry_run=False)
@@ -133,6 +135,8 @@ class ImportPathSafetyTests(unittest.TestCase):
             ("2026", "rollout-2026-10-02-2026"),
         ]:
             with self.subTest(source_id=source_id):
+                self.home = self.root / ("home-" + source_id)
+                self.home.mkdir()
                 self.bundle_for(session_id=source_id, member=f"sessions/raw_jsonl/{stem}.jsonl")
                 target_id = "new-" + source_id
                 result = self.imported(new_session_id=target_id, dry_run=False)
