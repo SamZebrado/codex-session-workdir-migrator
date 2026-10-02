@@ -112,3 +112,36 @@ class ImportPathSafetyTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(list(self.home.iterdir()), [])
         self.assertFalse((self.root / "backups").exists())
+
+    def test_source_ids_overlapping_extension_preserve_jsonl_suffix(self):
+        for source_id in ["jsonl", "l"]:
+            with self.subTest(source_id=source_id):
+                self.bundle_for(session_id=source_id, member=f"sessions/raw_jsonl/rollout-{source_id}.jsonl")
+                target_id = "target-" + source_id
+                result = self.imported(new_session_id=target_id, dry_run=False)
+                self.assertTrue(result["success"], result["errors"])
+                target = Path(result["imported_files"][0]["target"])
+                self.assertEqual(target.name, f"rollout-{target_id}.jsonl")
+                self.assertTrue(target.resolve().is_relative_to(self.home.resolve()))
+                self.assertEqual(json.loads(target.read_text())["payload"]["id"], target_id)
+
+    def test_only_terminal_id_in_filename_stem_is_rewritten(self):
+        for source_id, stem in [
+            ("l", "rollout-l-label-l"),
+            ("jsonl", "jsonl-prefix-jsonl"),
+            ("roll", "rollout-roll-roll"),
+            ("2026", "rollout-2026-10-02-2026"),
+        ]:
+            with self.subTest(source_id=source_id):
+                self.bundle_for(session_id=source_id, member=f"sessions/raw_jsonl/{stem}.jsonl")
+                target_id = "new-" + source_id
+                result = self.imported(new_session_id=target_id, dry_run=False)
+                self.assertTrue(result["success"], result["errors"])
+                target = Path(result["imported_files"][0]["target"])
+                self.assertEqual(target.name, stem[:-len(source_id)] + target_id + ".jsonl")
+
+    def test_source_id_inside_unrelated_filename_prefix_is_not_rewritten(self):
+        self.bundle_for(session_id="l", member="sessions/raw_jsonl/rollout-unrelated.jsonl")
+        result = self.imported(new_session_id="target-id", dry_run=False)
+        self.assertTrue(result["success"], result["errors"])
+        self.assertEqual(Path(result["imported_files"][0]["target"]).name, "rollout-unrelated.jsonl")

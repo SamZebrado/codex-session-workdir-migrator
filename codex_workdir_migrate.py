@@ -1352,7 +1352,13 @@ class CodexSessionMigrator:
                 for member in jsonl_members:
                     basename = os.path.basename(member)
                     if id_rewrite_mode != "none":
-                        basename = basename.replace(source_session_id, target_session_id)
+                        # Rollout filenames end in the ID; prefix text and the
+                        # .jsonl extension may also contain short source IDs.
+                        if basename.endswith(".jsonl"):
+                            stem = basename[:-len(".jsonl")]
+                            if stem.endswith(source_session_id):
+                                stem = stem[:-len(source_session_id)] + target_session_id
+                            basename = stem + ".jsonl"
                     target_path = os.path.join(target_dir, basename)
                     if (
                         not basename.endswith(".jsonl")
