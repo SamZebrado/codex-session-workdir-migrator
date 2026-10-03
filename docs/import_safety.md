@@ -91,7 +91,7 @@
 
 ### 场景 3: 目标机器已有该会话（残缺）
 
-- 仅 JSONL 或 SQLite 之一存在
+- JSONL、SQLite 或 index 任意一项存在，都视为会话冲突；残缺状态不是不存在
 - 使用 `--mode overwrite` 替换完整记录
 - **警告**: 这可能丢失目标机器上的某些更新
 
@@ -121,3 +121,13 @@ Bundle 的 SHA256SUMS.txt 和 manifest checksums 仅供人工审计；导入当�
 - ❌ 不要使用 merge 模式
 - ❌ 不要跳过 import-plan 直接 import
 - ❌ 不要在 Codex 运行时执行导入
+
+## 目标检查失败与不确定重试
+
+默认 `--on-conflict abort` 会拒绝任何同 ID 的 JSONL、SQLite 或 index 记录。只有成功检查且三者都不存在，才视为目标不存在。数据库锁定、损坏、权限不足、缺少 `threads.id`，或 index 非空行不是带非空字符串 ID 的对象、JSON 损坏或 ID 重复时，`import-plan` 报告 `unknown`，导入在备份、删除和写入之前失败。不会静默修复或丢弃残缺 index；保留原始字节，先人工恢复再重新检查。空行和有效的末行没有换行符可以读取，导入保留无关记录及空行。
+
+JSONL 文件名不证明会话归属。工具扫描 `sessions/` 和 `archived_sessions/`，只按 `session_meta.payload.id` 精确匹配，支持不规则文件名及安全的非 UUID ID。无法读取、JSON 损坏、缺少或冲突的 metadata ID 会阻止检查；其他消息的 `payload.id` 不作为会话身份。目的文件属于其他 ID 时，即使选择 overwrite 也拒绝写入。明确选择 `--mode overwrite` 或 `--on-conflict overwrite` 才允许替换同 ID 的数据，包括 index。
+
+自动 `--on-conflict import-as-new` 每次生成新的 UUID；重复执行是两次有意克隆，不按源内容相似度去重。需要可重启的克隆时，在首次执行前选定 `--new-session-id <explicit-id>`，保存原始 bundle、返回/指定的目标 ID、路径映射、冲突模式、备份和 `imported_files`。同 ID 已存在只证明冲突，不证明内容等价或导入完整。
+
+若响应丢失或导入中断，先用已知目标 ID 检查目标再决定下一步，不要直接再次自动克隆。`success=false` 也可能已经写入 JSONL；工具仍没有跨文件事务或自动回滚保证。部分导入会阻止默认重试；覆盖必须是检查后的明确选择。导入期间目标 home 必须停止其他写入，本次检查不是并发锁或在线快照。

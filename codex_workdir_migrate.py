@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -102,6 +103,10 @@ class BundleManifest:
         return asdict(self)
 
 
+class TargetInspectionError(RuntimeError):
+    """Target ownership or stored state could not be established safely."""
+
+
 class CodexSessionMigrator:
     @staticmethod
     def _valid_session_id(session_id):
@@ -117,40 +122,98 @@ class CodexSessionMigrator:
         self.state_db_path = os.path.join(self.codex_home, "state_5.sqlite")
         self.session_index_path = os.path.join(self.codex_home, "session_index.jsonl")
 
+    @staticmethod
+    def _target_path_present(path):
+        try:
+            os.stat(path)
+            return True
+        except FileNotFoundError as e:
+            if os.path.lexists(path):
+                raise TargetInspectionError(f"Cannot inspect target {path}: dangling symlink") from e
+            return False
+        except OSError as e:
+            raise TargetInspectionError(f"Cannot inspect target {path}: {e}") from e
+
     def find_session_file(self, session_id):
-        """Find JSONL file(s) for a given session ID."""
+        """Select JSONL only by exact session_meta identity, never filename text."""
         candidates = []
+
+        def walk_error(error):
+            raise TargetInspectionError(f"Cannot inspect session directory: {error}") from error
+
         for base_dir in [self.sessions_dir, self.archived_sessions_dir]:
-            if not os.path.exists(base_dir):
+            if not self._target_path_present(base_dir):
                 continue
-            for root, _, files in os.walk(base_dir):
-                for file in files:
-                    if file.endswith(".jsonl") and session_id in file:
-                        candidates.append(os.path.join(root, file))
-
-        if not candidates:
-            for base_dir in [self.sessions_dir, self.archived_sessions_dir]:
-                if not os.path.exists(base_dir):
-                    continue
-                for root, _, files in os.walk(base_dir):
-                    for file in files:
-                        if not file.endswith(".jsonl"):
-                            continue
-                        full_path = os.path.join(root, file)
-                        try:
-                            with open(full_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        data = json.loads(line)
-                                        if data.get("payload", {}).get("id") == session_id:
-                                            candidates.append(full_path)
-                                            break
-                                    except json.JSONDecodeError:
-                                        continue
-                        except Exception:
-                            continue
-
+            for root, dirs, files in os.walk(base_dir, onerror=walk_error):
+                dirs.sort()
+                for file in sorted(files):
+                    if not file.endswith(".jsonl"):
+                        continue
+                    full_path = os.path.join(root, file)
+                    identity = None
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            for line_num, line in enumerate(f, 1):
+                                if not line.strip():
+                                    continue
+                                try:
+                                    data = json.loads(line)
+                                except json.JSONDecodeError as e:
+                                    raise TargetInspectionError(
+                                        f"Malformed session JSONL {full_path} line {line_num}: {e}"
+                                    ) from e
+                                if not isinstance(data, dict):
+                                    raise TargetInspectionError(
+                                        f"Invalid session record {full_path} line {line_num}"
+                                    )
+                                if data.get("type") == "session_meta":
+                                    payload = data.get("payload")
+                                    record_id = payload.get("id") if isinstance(payload, dict) else None
+                                    if not isinstance(record_id, str) or not record_id:
+                                        raise TargetInspectionError(
+                                            f"Missing session_meta identity {full_path} line {line_num}"
+                                        )
+                                    if identity is not None and identity != record_id:
+                                        raise TargetInspectionError(f"Ambiguous session identity in {full_path}")
+                                    identity = record_id
+                    except (OSError, UnicodeError) as e:
+                        raise TargetInspectionError(f"Cannot read session JSONL {full_path}: {e}") from e
+                    if identity is None:
+                        raise TargetInspectionError(f"Missing session_meta identity in {full_path}")
+                    if identity == session_id:
+                        candidates.append(full_path)
         return candidates
+
+    def _read_target_index(self):
+        """Validate the entire index, including unrelated rows and interrupted tails."""
+        records = {}
+        lines = []
+        if not self._target_path_present(self.session_index_path):
+            return records, lines
+        try:
+            with open(self.session_index_path, "r", encoding="utf-8", newline="") as f:
+                for line_num, line in enumerate(f, 1):
+                    lines.append(line)
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        raise TargetInspectionError(
+                            f"Malformed target index {self.session_index_path} line {line_num}: {e}"
+                        ) from e
+                    if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not record["id"]:
+                        raise TargetInspectionError(
+                            f"Invalid target index record {self.session_index_path} line {line_num}: expected object with nonempty string id"
+                        )
+                    if record["id"] in records:
+                        raise TargetInspectionError(
+                            f"Ambiguous target index ID {record['id']} at line {line_num}"
+                        )
+                    records[record["id"]] = record
+        except (OSError, UnicodeError) as e:
+            raise TargetInspectionError(f"Cannot read target index {self.session_index_path}: {e}") from e
+        return records, lines
 
     def _rewrite_path_value(
         self, value: Optional[str], old_cwd: str, new_cwd: str, rewrite_prefix_paths: bool
@@ -401,17 +464,9 @@ class CodexSessionMigrator:
             result["jsonl_files"].append(file_info)
 
         try:
-            if os.path.exists(self.session_index_path):
-                with open(self.session_index_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            if data.get("id") == session_id:
-                                result["session_index"] = data
-                                break
-                        except json.JSONDecodeError:
-                            continue
-        except Exception as e:
+            records, _ = self._read_target_index()
+            result["session_index"] = records.get(session_id, {})
+        except TargetInspectionError as e:
             result["session_index"]["error"] = str(e)
 
         try:
@@ -997,47 +1052,32 @@ class CodexSessionMigrator:
         return result
 
     def check_import_target(self, session_id):
-        """Check if session already exists on target machine."""
+        """Return known target state; inspection failures never imply absence."""
         target_info = {
             "session_exists": False,
-            "jsonl_files": [],
+            "jsonl_files": self.find_session_file(session_id),
             "sqlite_record": None,
             "session_index_record": None,
         }
-
-        target_jsonl_files = self.find_session_file(session_id)
-        if target_jsonl_files:
-            target_info["session_exists"] = True
-            target_info["jsonl_files"] = target_jsonl_files
-
-        try:
-            if os.path.exists(self.state_db_path):
-                db = self._connect_state_db(readonly=True)
-                cursor = db.cursor()
-                cursor.execute("SELECT * FROM threads WHERE id = ?", (session_id,))
-                row = cursor.fetchone()
-                if row:
-                    cursor.execute("PRAGMA table_info(threads)")
-                    col_names = [c[1] for c in cursor.fetchall()]
-                    target_info["sqlite_record"] = dict(zip(col_names, row))
-                db.close()
-        except Exception:
-            pass
-
-        try:
-            if os.path.exists(self.session_index_path):
-                with open(self.session_index_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line.strip())
-                            if data.get("id") == session_id:
-                                target_info["session_index_record"] = data
-                                break
-                        except json.JSONDecodeError:
-                            continue
-        except Exception:
-            pass
-
+        if self._target_path_present(self.state_db_path):
+            try:
+                with closing(self._connect_state_db(readonly=True)) as db:
+                    cursor = db.execute("SELECT * FROM threads WHERE id = ?", (session_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        target_info["sqlite_record"] = dict(zip(
+                            [column[0] for column in cursor.description], row
+                        ))
+            except (sqlite3.Error, OSError) as e:
+                raise TargetInspectionError(f"Cannot read target SQLite {self.state_db_path}: {e}") from e
+        records, lines = self._read_target_index()
+        target_info["session_index_record"] = records.get(session_id)
+        target_info["index_records"] = records
+        target_info["index_lines"] = lines
+        target_info["session_exists"] = bool(
+            target_info["jsonl_files"] or target_info["sqlite_record"] is not None
+            or target_info["session_index_record"] is not None
+        )
         return target_info
 
     def import_plan(self, bundle_path, cwd_mappings, policy=None):
@@ -1103,10 +1143,10 @@ class CodexSessionMigrator:
 
                 target_info = self.check_import_target(source_session_id)
 
-                has_jsonl = target_info["session_exists"]
+                has_jsonl = bool(target_info["jsonl_files"])
                 has_sqlite = target_info["sqlite_record"] is not None
                 has_index = target_info["session_index_record"] is not None
-                session_exists = has_jsonl or has_sqlite
+                session_exists = has_jsonl or has_sqlite or has_index
                 result["session_exists_on_target"] = session_exists
 
                 if not has_jsonl and not has_sqlite and not has_index:
@@ -1179,25 +1219,22 @@ class CodexSessionMigrator:
                         )
                     else:
                         try:
-                            db = self._connect_state_db(readonly=True)
-                            cursor = db.cursor()
-                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
-                            if not cursor.fetchone():
-                                result["errors"].append(
-                                    "Bundle contains SQLite data but target has no 'threads' table. Import will fail. Initialize Codex on target machine first."
-                                )
-                            elif cwd_map:
-                                planned_sqlite_updates.append({
-                                    "action": "update",
-                                    "table": "threads",
-                                    "fields": ["cwd", "sandbox_policy"],
-                                    "cwd_mapping": cwd_map,
-                                })
-                            db.close()
+                            with closing(self._connect_state_db(readonly=True)) as db:
+                                cursor = db.cursor()
+                                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
+                                if not cursor.fetchone():
+                                    result["errors"].append(
+                                        "Bundle contains SQLite data but target has no 'threads' table. Import will fail. Initialize Codex on target machine first."
+                                    )
+                                elif cwd_map:
+                                    planned_sqlite_updates.append({
+                                        "action": "update",
+                                        "table": "threads",
+                                        "fields": ["cwd", "sandbox_policy"],
+                                        "cwd_mapping": cwd_map,
+                                    })
                         except Exception as e:
-                            result["warnings"].append(
-                                f"Could not check target SQLite: {e}. SQLite import may fail."
-                            )
+                            raise TargetInspectionError(f"Cannot check target SQLite schema: {e}") from e
                 elif cwd_map:
                     planned_sqlite_updates.append({
                         "action": "update",
@@ -1242,6 +1279,10 @@ class CodexSessionMigrator:
                 if not result["errors"]:
                     result["success"] = True
 
+        except TargetInspectionError as e:
+            result["target_status"] = {"status": "unknown", "message": str(e)}
+            result["session_exists_on_target"] = None
+            result["errors"].append(f"Target inspection failed: {e}")
         except Exception as e:
             result["errors"].append(f"Failed to read bundle: {e}")
 
@@ -1322,10 +1363,10 @@ class CodexSessionMigrator:
 
                 target_info = self.check_import_target(source_session_id)
 
-                has_jsonl = target_info["session_exists"]
+                has_jsonl = bool(target_info["jsonl_files"])
                 has_sqlite = target_info["sqlite_record"] is not None
                 has_index = target_info["session_index_record"] is not None
-                session_exists = has_jsonl or has_sqlite
+                session_exists = has_jsonl or has_sqlite or has_index
 
                 effective_on_conflict = on_conflict
                 if mode == "overwrite" and on_conflict == "abort":
@@ -1373,7 +1414,7 @@ class CodexSessionMigrator:
 
                 if target_session_id != source_session_id:
                     target_info_new = self.check_import_target(target_session_id)
-                    has_jsonl_new = target_info_new["session_exists"]
+                    has_jsonl_new = bool(target_info_new["jsonl_files"])
                     has_sqlite_new = target_info_new["sqlite_record"] is not None
                     has_index_new = target_info_new["session_index_record"] is not None
                     target_session_exists = has_jsonl_new or has_sqlite_new or has_index_new
@@ -1400,6 +1441,10 @@ class CodexSessionMigrator:
                     )
                     return result
 
+                for _, target_path in jsonl_targets:
+                    if self._target_path_present(target_path) and target_path not in target_info["jsonl_files"]:
+                        raise TargetInspectionError(f"JSONL destination belongs to another session: {target_path}")
+
                 sqlite_member = "sqlite/state_db_matching_rows.json"
                 has_sqlite_in_bundle = sqlite_member in zf.namelist()
                 
@@ -1416,47 +1461,40 @@ class CodexSessionMigrator:
                         return result
                     
                     try:
-                        db = self._connect_state_db(readonly=True)
-                        cursor = db.cursor()
-                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
-                        if not cursor.fetchone():
-                            result["errors"].append(
-                                f"Bundle contains SQLite data but target has no 'threads' table. "
-                                f"Import will fail. Initialize Codex on target machine first."
-                            )
-                            db.close()
-                            return result
-                        
-                        cursor.execute("PRAGMA table_info(threads)")
-                        not_null_columns = set()
-                        for row in cursor.fetchall():
-                            col_name = row[1]
-                            not_null = row[3]
-                            dflt_value = row[4]
-                            if not_null and dflt_value is None:
-                                not_null_columns.add(col_name)
-                        
-                        if bundle_rows and not_null_columns:
-                            missing_not_null = []
-                            bundle_row = bundle_rows[0]
-                            for col in not_null_columns:
-                                if col not in bundle_row or bundle_row.get(col) is None:
-                                    missing_not_null.append(col)
-                            
-                            if missing_not_null:
+                        with closing(self._connect_state_db(readonly=True)) as db:
+                            cursor = db.cursor()
+                            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'")
+                            if not cursor.fetchone():
                                 result["errors"].append(
-                                    f"Bundle SQLite row missing NOT NULL columns without defaults: {missing_not_null}. "
-                                    f"Import will fail. Ensure bundle contains all required columns."
+                                    f"Bundle contains SQLite data but target has no 'threads' table. "
+                                    f"Import will fail. Initialize Codex on target machine first."
                                 )
-                                db.close()
                                 return result
                         
-                        db.close()
+                            cursor.execute("PRAGMA table_info(threads)")
+                            not_null_columns = set()
+                            for row in cursor.fetchall():
+                                col_name = row[1]
+                                not_null = row[3]
+                                dflt_value = row[4]
+                                if not_null and dflt_value is None:
+                                    not_null_columns.add(col_name)
+
+                            if bundle_rows and not_null_columns:
+                                missing_not_null = []
+                                bundle_row = bundle_rows[0]
+                                for col in not_null_columns:
+                                    if col not in bundle_row or bundle_row.get(col) is None:
+                                        missing_not_null.append(col)
+
+                                if missing_not_null:
+                                    result["errors"].append(
+                                        f"Bundle SQLite row missing NOT NULL columns without defaults: {missing_not_null}. "
+                                        f"Import will fail. Ensure bundle contains all required columns."
+                                    )
+                                    return result
                     except Exception as e:
-                        result["errors"].append(
-                            f"Failed to check target SQLite: {e}. Import will fail."
-                        )
-                        return result
+                        raise TargetInspectionError(f"Cannot check target SQLite schema: {e}") from e
 
                 files_to_backup = []
                 if os.path.exists(self.state_db_path):
@@ -1690,17 +1728,8 @@ class CodexSessionMigrator:
                     index_content = zf.read(index_member).decode("utf-8")
 
                     index_path = self.session_index_path
-                    existing_records = {}
-
-                    if os.path.exists(index_path):
-                        with open(index_path, "r", encoding="utf-8") as f:
-                            for line in f:
-                                try:
-                                    record = json.loads(line.strip())
-                                    if record.get("id"):
-                                        existing_records[record["id"]] = line
-                                except json.JSONDecodeError:
-                                    continue
+                    existing_records = target_info["index_records"]
+                    existing_index_lines = target_info["index_lines"]
 
                     session_index_record = None
                     for line in index_content.splitlines():
@@ -1743,20 +1772,25 @@ class CodexSessionMigrator:
                                     source_session_id, target_session_id
                                 )
 
-                        if mode == "skip" and target_session_id in existing_records:
+                        if mode == "skip" and effective_on_conflict != "overwrite" and target_session_id in existing_records:
                             result["imported_files"].append({
                                 "type": "session_index",
                                 "action": "skipped",
                                 "reason": "session exists",
                             })
                         else:
-                            existing_records[target_session_id] = json.dumps(session_index_record, ensure_ascii=False) + "\n"
+                            new_index_line = json.dumps(session_index_record, ensure_ascii=False) + "\n"
 
                             if not dry_run:
                                 temp_path = index_path + ".tmp"
-                                with open(temp_path, "w", encoding="utf-8") as f:
-                                    for rec_line in existing_records.values():
+                                with open(temp_path, "w", encoding="utf-8", newline="") as f:
+                                    for rec_line in existing_index_lines:
+                                        if rec_line.strip() and json.loads(rec_line)["id"] == target_session_id:
+                                            continue
                                         f.write(rec_line)
+                                    if existing_index_lines and not existing_index_lines[-1].endswith(("\n", "\r")):
+                                        f.write("\n")
+                                    f.write(new_index_line)
                                 os.replace(temp_path, index_path)
 
                             result["imported_files"].append({
@@ -1768,6 +1802,8 @@ class CodexSessionMigrator:
 
                 result["success"] = True
 
+        except TargetInspectionError as e:
+            result["errors"].append(f"Target inspection failed: {e}")
         except Exception as e:
             result["errors"].append(f"Import failed: {e}")
 
