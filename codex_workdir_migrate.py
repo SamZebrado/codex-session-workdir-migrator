@@ -15,6 +15,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
@@ -146,6 +147,18 @@ class CodexSessionMigrator:
                 continue
             for root, dirs, files in os.walk(base_dir, onerror=walk_error):
                 dirs.sort()
+                # os.walk does not descend directory links, including links
+                # to sessions with irregular filenames. Skipping is unknown
+                # ownership, not authoritative absence. Dangling links can
+                # appear in files instead of dirs and must also block.
+                for entry in dirs + files:
+                    full_path = os.path.join(root, entry)
+                    try:
+                        linked = stat.S_ISLNK(os.lstat(full_path).st_mode)
+                    except OSError as e:
+                        raise TargetInspectionError(f"Cannot inspect session entry {full_path}: {e}") from e
+                    if linked and (entry in dirs or not entry.endswith(".jsonl")):
+                        raise TargetInspectionError(f"Unsupported session directory link: {full_path}")
                 for file in sorted(files):
                     if not file.endswith(".jsonl"):
                         continue
@@ -1412,8 +1425,10 @@ class CodexSessionMigrator:
                         return result
                     jsonl_targets.append((member, target_path))
 
+                destination_info = target_info
                 if target_session_id != source_session_id:
                     target_info_new = self.check_import_target(target_session_id)
+                    destination_info = target_info_new
                     has_jsonl_new = bool(target_info_new["jsonl_files"])
                     has_sqlite_new = target_info_new["sqlite_record"] is not None
                     has_index_new = target_info_new["session_index_record"] is not None
@@ -1442,8 +1457,11 @@ class CodexSessionMigrator:
                     return result
 
                 for _, target_path in jsonl_targets:
-                    if self._target_path_present(target_path) and target_path not in target_info["jsonl_files"]:
-                        raise TargetInspectionError(f"JSONL destination belongs to another session: {target_path}")
+                    if self._target_path_present(target_path) and (
+                        effective_on_conflict != "overwrite"
+                        or target_path not in destination_info["jsonl_files"]
+                    ):
+                        raise TargetInspectionError(f"JSONL destination belongs to another session or overwrite is not authorized: {target_path}")
 
                 sqlite_member = "sqlite/state_db_matching_rows.json"
                 has_sqlite_in_bundle = sqlite_member in zf.namelist()
