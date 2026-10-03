@@ -1429,16 +1429,16 @@ class CodexSessionMigrator:
                 if target_session_id != source_session_id:
                     target_info_new = self.check_import_target(target_session_id)
                     destination_info = target_info_new
-                    has_jsonl_new = bool(target_info_new["jsonl_files"])
-                    has_sqlite_new = target_info_new["sqlite_record"] is not None
-                    has_index_new = target_info_new["session_index_record"] is not None
-                    target_session_exists = has_jsonl_new or has_sqlite_new or has_index_new
-
-                    if target_session_exists:
-                        result["errors"].append(
-                            f"Target session id '{target_session_id}' already exists on target. Use a different --new-session-id or --on-conflict overwrite."
-                        )
-                        return result
+                # A clone needs an unoccupied effective ID even when an
+                # explicit choice equals the source ID. Reuse its known state.
+                if destination_info["session_exists"] and (
+                    target_session_id != source_session_id
+                    or effective_on_conflict == "import-as-new"
+                ):
+                    result["errors"].append(
+                        f"Target session id '{target_session_id}' already exists on target. Use a different --new-session-id or --on-conflict overwrite."
+                    )
+                    return result
 
                 if session_exists and effective_on_conflict == "abort":
                     result["errors"].append(

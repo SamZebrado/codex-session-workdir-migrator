@@ -1,8 +1,10 @@
 """Regressions for independently observed destination and enumeration guards."""
 import json
+import sqlite3
 import tempfile
 import unittest
 import zipfile
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -109,3 +111,52 @@ class ImportReviewGuardTests(unittest.TestCase):
         (held / "existing.jsonl").write_text(self.metadata)
         (self.home / "sessions" / "nested.jsonl").symlink_to(held, target_is_directory=True)
         self.assert_import_blocked(self.snapshot())
+
+    def occupied_source_bundle(self):
+        self.make_bundle("different-path-" + SID + ".jsonl")
+        archive = self.home / "archived_sessions"
+        archive.mkdir()
+        (archive / "irregular.jsonl").write_text(self.metadata)
+        (self.home / "session_index.jsonl").write_text(json.dumps({"id": SID, "title": "existing"}) + "\n")
+        db_path = self.home / "state_5.sqlite"
+        with closing(sqlite3.connect(db_path)) as db:
+            db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT)")
+            db.execute("INSERT INTO threads VALUES (?, ?)", (SID, "/existing"))
+            db.commit()
+        with zipfile.ZipFile(self.bundle, "a") as z:
+            z.writestr("sqlite/state_db_matching_rows.json", json.dumps({"matching_rows": [{"id": SID, "cwd": "/imported"}]}))
+            z.writestr("index/session_index_records.jsonl", json.dumps({"id": SID, "title": "imported"}) + "\n")
+        return db_path
+
+    def test_occupied_equal_id_clone_blocks_before_any_mutation(self):
+        db_path = self.occupied_source_bundle()
+        before = self.snapshot()
+        for no_backup in [False, True]:
+            for mode in ["skip", "overwrite"]:
+                with self.subTest(no_backup=no_backup, mode=mode):
+                    self.assert_import_blocked(before, new_session_id=SID,
+                                               on_conflict="import-as-new", mode=mode,
+                                               no_backup=no_backup)
+        with closing(sqlite3.connect(db_path)) as db:
+            self.assertEqual("/existing", db.execute("SELECT cwd FROM threads WHERE id = ?", (SID,)).fetchone()[0])
+
+    def test_distinct_clone_and_equal_id_authorized_overwrite_remain_supported(self):
+        db_path = self.occupied_source_bundle()
+        source = self.home / "archived_sessions" / "irregular.jsonl"
+        original = source.read_bytes()
+        clone = self.m.import_bundle(str(self.bundle), [], None, dry_run=False,
+                                     no_backup=True, new_session_id="distinct-clone",
+                                     on_conflict="import-as-new")
+        self.assertTrue(clone["success"], clone)
+        self.assertEqual(original, source.read_bytes())
+        with closing(sqlite3.connect(db_path)) as db:
+            self.assertEqual("/existing", db.execute("SELECT cwd FROM threads WHERE id = ?", (SID,)).fetchone()[0])
+            self.assertEqual("/imported", db.execute("SELECT cwd FROM threads WHERE id = ?", ("distinct-clone",)).fetchone()[0])
+        overwritten = self.m.import_bundle(str(self.bundle), [], None, dry_run=False,
+                                          no_backup=True, new_session_id=SID,
+                                          on_conflict="overwrite")
+        self.assertTrue(overwritten["success"], overwritten)
+        with closing(sqlite3.connect(db_path)) as db:
+            self.assertEqual("/imported", db.execute("SELECT cwd FROM threads WHERE id = ?", (SID,)).fetchone()[0])
+        index = [json.loads(line) for line in (self.home / "session_index.jsonl").read_text().splitlines()]
+        self.assertEqual("imported", next(row for row in index if row["id"] == SID)["title"])
