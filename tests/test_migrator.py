@@ -14,7 +14,7 @@ NEW = "/new/workdir"
 
 def _write_jsonl(path: Path):
     records = [
-        {"type": "session_meta", "payload": {"cwd": OLD}},
+        {"type": "session_meta", "payload": {"id": SESSION_ID, "cwd": OLD}},
         {"type": "turn_context", "payload": {"cwd": OLD}},
         {
             "type": "response_item",

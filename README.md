@@ -193,9 +193,9 @@ bundle.zip/
 - `--mode overwrite`：备份后覆盖已有会话
 
 **推荐冲突策略（`--on-conflict`）**：
-- `--on-conflict abort`（默认）：如果目标机器已有该会话，则报错退出
+- `--on-conflict abort`（默认）：如果目标机器已有该会话，则报错退出（JSONL、SQLite、index 任一项存在都算冲突；读取失败或身份不明会阻止导入）
 - `--on-conflict overwrite`：备份后覆盖已有会话
-- `--on-conflict import-as-new`：即使目标机器已有该会话，导入为新会话
+- `--on-conflict import-as-new`：即使目标机器已有该会话，导入为新会话。每次自动生成新 ID，重复执行会创建独立克隆；不按内容相似度去重
 
 **导入时新建 session ID**：
 - `--new-session-id auto`：自动生成新 session ID
@@ -359,3 +359,5 @@ python3 codex_workdir_migrate.py import-bundle \
 - [import_safety.md](docs/import_safety.md) - 导入安全指南
 - [known_limits.md](docs/known_limits.md) - 已知限制
 - [migration_design.md](docs/migration_design.md) - 迁移设计文档
+
+不确定导入结果时，保存 bundle、目标 ID、映射、冲突模式、备份和 `imported_files`，先检查目标再重试。需要重启后沿用同一克隆身份时，首次执行前指定 `--new-session-id <explicit-id>`；现有 ID 是冲突证据，不是成功或内容等价凭据。详见 [导入安全指南](docs/import_safety.md#目标检查失败与不确定重试)。
